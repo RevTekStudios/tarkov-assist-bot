@@ -1,0 +1,10 @@
+CREATE TABLE IF NOT EXISTS watches (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  guild_id TEXT NOT NULL,
+  channel_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  item_name TEXT NOT NULL,
+  max_price INTEGER NOT NULL,
+  once INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL
+);

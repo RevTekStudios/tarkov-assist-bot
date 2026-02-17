@@ -1,0 +1,3 @@
+ALTER TABLE watches ADD COLUMN item_key TEXT;
+ALTER TABLE watches ADD COLUMN cooldown_until INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE watches ADD COLUMN item_id TEXT;

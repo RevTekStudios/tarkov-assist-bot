@@ -1,0 +1,22 @@
+{
+  "name": "flea-worker",
+  "main": "src/index.js",
+  "compatibility_date": "2026-02-12",
+
+  // Enable workers.dev URL (you’re using it)
+  "workers_dev": true,
+
+  // D1 Database Binding
+  "d1_databases": [
+    {
+      "binding": "flea_bot_db",
+      "database_name": "flea_bot_db",
+      "database_id": "b94c22c2-05b9-41fe-92d7-dc81b0e72750"
+    }
+  ],
+
+  // Cron trigger (runs every minute)
+  "triggers": {
+    "crons": ["*/1 * * * *"]
+  }
+}
