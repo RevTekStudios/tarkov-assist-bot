@@ -3,10 +3,15 @@ import { verifyKey } from "discord-interactions";
 
 const TARKOV_GQL = "https://api.tarkov.dev/graphql";
 
+// ====== Version ======
+const BOT_VERSION = "0.2.0";
+
 // ====== Tuning knobs ======
-const COOLDOWN_MINUTES = 10;        // how long to wait after alerting (non-once watches)
+const COOLDOWN_MINUTES = 10;        // cooldown after alert (non-once watches)
 const WEEKLY_REFRESH = true;        // keep weekly dictionary refresh
-const DEBUG_PRICES = false;         // set true if you want cron to log price fields
+const DEBUG_PRICES = false;         // log price raw fields
+const MAX_WATCHES_PER_USER = 25;    // watch limit per user per guild
+const MAX_WATCHES_PER_GUILD = 500;  // watch limit per guild
 
 const json = (obj, status = 200) =>
   new Response(JSON.stringify(obj), {
@@ -14,25 +19,27 @@ const json = (obj, status = 200) =>
     headers: { "content-type": "application/json" },
   });
 
-async function followup(interaction, content) {
+async function followup(interaction, payload) {
+  // payload can be { content } OR { content, embeds }
   return fetch(
     `https://discord.com/api/v10/webhooks/${interaction.application_id}/${interaction.token}`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ content }),
+      body: JSON.stringify(payload),
     }
   );
 }
 
-async function sendChannelMessage(env, channelId, content) {
+async function sendChannelMessage(env, channelId, payload) {
+  // payload can be { content } OR { content, embeds }
   return fetch(`https://discord.com/api/v10/channels/${channelId}/messages`, {
     method: "POST",
     headers: {
       Authorization: `Bot ${env.DISCORD_BOT_TOKEN}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ content }),
+    body: JSON.stringify(payload),
   });
 }
 
@@ -43,6 +50,12 @@ function nameKey(s) {
     .replace(/['"]/g, "")
     .replace(/[^a-z0-9]+/g, " ")
     .trim();
+}
+
+function formatRUB(n) {
+  const num = Number(n || 0);
+  if (!Number.isFinite(num)) return "0 ₽";
+  return `${num.toLocaleString()} ₽`;
 }
 
 // ADMIN allow-list (comma-separated user IDs in a Worker secret or env var)
@@ -89,19 +102,18 @@ async function metaSet(env, key, value) {
 
 /**
  * Resolve to an item record (id + canonical name + short name) from D1.
- * This lets us store canonical naming and avoid weird user-typed variants.
  */
 async function resolveItemFromD1(env, itemName) {
   const key = nameKey(itemName);
 
-  // Exact match
+  // Exact
   const exact = await env.flea_bot_db
     .prepare(`SELECT id, name, short_name FROM items WHERE name_key=? LIMIT 1`)
     .bind(key)
     .first();
   if (exact?.id) return exact;
 
-  // Loose match
+  // Loose
   const like = await env.flea_bot_db
     .prepare(`SELECT id, name, short_name FROM items WHERE name_key LIKE ? LIMIT 1`)
     .bind(`%${key}%`)
@@ -155,11 +167,9 @@ async function importAllItemsIntoD1(env) {
 
 /**
  * Fetch item flea-ish prices from tarkov.dev.
- * We prioritize:
- *   1) avg24hPrice (stable)
- *   2) lastLowPrice (recent)
- * Optional fallback:
- *   3) sellFor vendor prices (NOT flea, but helps avoid "0" results)
+ * Priority:
+ *  1) avg24hPrice
+ *  2) lastLowPrice
  */
 async function getMarketPriceRUB(itemId) {
   const q = `
@@ -169,10 +179,6 @@ async function getMarketPriceRUB(itemId) {
         name
         avg24hPrice
         lastLowPrice
-        sellFor {
-          price
-          source
-        }
       }
     }
   `;
@@ -185,20 +191,69 @@ async function getMarketPriceRUB(itemId) {
   const avg = typeof it.avg24hPrice === "number" ? it.avg24hPrice : 0;
   const low = typeof it.lastLowPrice === "number" ? it.lastLowPrice : 0;
 
-  // Optional fallback: best vendor price (NOT flea) – last resort
-  let vendor = 0;
-  if (Array.isArray(it.sellFor) && it.sellFor.length) {
-    vendor = it.sellFor.reduce((m, x) => (x?.price > m ? x.price : m), 0);
-  }
-
-  // Correct priority: avg24h first, then lastLow
   const price = (avg > 0 ? avg : 0) || (low > 0 ? low : 0) || 0;
 
   return {
     ok: true,
     name: it.name || null,
     price,
-    raw: DEBUG_PRICES ? { avg, low, vendor } : null,
+    raw: DEBUG_PRICES ? { avg, low } : null,
+  };
+}
+
+/**
+ * Autocomplete helper (Discord Interaction type 4)
+ */
+async function autocompleteItems(env, userTyped) {
+  const q = nameKey(userTyped);
+  const pattern = q ? `%${q}%` : `%`;
+
+  // 1) Exact-start matches first, then contains; shortest keys first
+  const rows = await env.flea_bot_db
+    .prepare(
+      `SELECT name, short_name
+       FROM items
+       WHERE name_key LIKE ?
+       ORDER BY
+         CASE WHEN name_key LIKE ? THEN 0 ELSE 1 END,
+         LENGTH(name_key) ASC
+       LIMIT 25`
+    )
+    .bind(pattern, q ? `${q}%` : `%`)
+    .all();
+
+  const results = rows?.results || [];
+  return results.map((r) => ({
+    name: r.short_name ? `${r.name} (${r.short_name})` : r.name,
+    value: r.name, // what gets fed back to the command
+  }));
+}
+
+async function countUserWatches(env, guildId, userId) {
+  const row = await env.flea_bot_db
+    .prepare(`SELECT COUNT(1) AS c FROM watches WHERE guild_id=? AND user_id=?`)
+    .bind(guildId, userId)
+    .first();
+  return Number(row?.c || 0);
+}
+
+async function countGuildWatches(env, guildId) {
+  const row = await env.flea_bot_db
+    .prepare(`SELECT COUNT(1) AS c FROM watches WHERE guild_id=?`)
+    .bind(guildId)
+    .first();
+  return Number(row?.c || 0);
+}
+
+function buildPriceEmbed({ title, current, target, note }) {
+  const desc =
+    `💰 Current: **${formatRUB(current)}**\n` +
+    (target ? `🎯 Target: **${formatRUB(target)}**\n` : "") +
+    (note ? `ℹ️ ${note}\n` : "");
+
+  return {
+    title,
+    description: desc.trim(),
   };
 }
 
@@ -222,47 +277,16 @@ export default {
       return new Response("Bad JSON", { status: 400 });
     }
 
-    async function autocompleteItems(env, userTyped) {
-      const q = nameKey(userTyped);
-
-      // If they typed nothing, return common-ish items (just some results)
-      const pattern = q ? `%${q}%` : `%`;
-
-      const rows = await env.flea_bot_db
-        .prepare(
-          `SELECT name, short_name
-          FROM items
-          WHERE name_key LIKE ?
-          ORDER BY LENGTH(name_key) ASC
-          LIMIT 25`
-        )
-        .bind(pattern)
-        .all();
-
-      const results = rows?.results || [];
-
-      // Discord expects [{ name, value }]
-      return results.map(r => ({
-        name: r.short_name ? `${r.name} (${r.short_name})` : r.name,
-        value: r.name // IMPORTANT: value must be what gets sent back into /watch
-      }));
-    }
-
     // Ping
     if (interaction.type === 1) return json({ type: 1 });
 
     // Autocomplete
     if (interaction.type === 4) {
-      const itemsCount = Number((await metaGet(env, "items_count")) || 0);
-      if (!itemsCount) {
-        return json({ type: 8, data: { choices: [] } });
-      }
-      const focused = interaction.data?.options?.find(o => o.focused);
+      const focused = interaction.data?.options?.find((o) => o.focused);
       const typed = focused?.value ? String(focused.value) : "";
 
       let choices = [];
       try {
-        // Only autocomplete for the "item" field
         if (focused?.name === "item") {
           choices = await autocompleteItems(env, typed);
         }
@@ -273,7 +297,7 @@ export default {
 
       return json({
         type: 8, // AUTOCOMPLETE RESULT
-        data: { choices }
+        data: { choices },
       });
     }
 
@@ -287,39 +311,98 @@ export default {
       const channelId = interaction.channel_id || "";
       const userId = interaction.member?.user?.id || interaction.user?.id || "";
 
-      // Always defer to avoid 3s timeouts
+      // Defer to avoid 3s timeouts
       const deferred = json({ type: 5 });
 
       ctx.waitUntil(
         (async () => {
           try {
             if (!guildId || !channelId || !userId) {
-              await followup(interaction, "⚠️ Missing guild/channel/user context.");
+              await followup(interaction, { content: "⚠️ Missing guild/channel/user context." });
               return;
             }
 
+            // Help
             if (name === "help") {
-              await followup(
-                interaction,
-                "🧠 **Tarkov Assist Bot**\n" +
+              await followup(interaction, {
+                content:
+                  "🧠 **Tarkov Assist Bot**\n" +
                   "• `/watch item max_price [once]` — watch a flea price\n" +
+                  "• `/price item` — check current flea price\n" +
                   "• `/listwatches` — show your watches\n" +
                   "• `/unwatch item` — remove a watch\n" +
-                  "• `/syncitems` — (admin) refresh local item dictionary\n"
-              );
+                  "• `/clearwatches` — remove ALL your watches\n" +
+                  "• `/syncitems` — (admin) refresh local item dictionary\n" +
+                  "• `/version` — show bot version\n",
+              });
               return;
             }
 
-            // Admin-only: /syncitems
+            // Version
+            if (name === "version") {
+              await followup(interaction, { content: `✅ Tarkov Assist Bot version **${BOT_VERSION}**` });
+              return;
+            }
+
+            // Admin: sync items
             if (name === "syncitems") {
               if (!isAdmin(env, userId)) {
-                await followup(interaction, "⛔ This command is admin-only.");
+                await followup(interaction, { content: "⛔ This command is admin-only." });
+                return;
+              }
+              await followup(interaction, { content: "⏳ Syncing item dictionary from tarkov.dev…" });
+              const count = await importAllItemsIntoD1(env);
+              await followup(interaction, { content: `✅ Synced **${count.toLocaleString()}** items into D1.` });
+              return;
+            }
+
+            // Safety: must have items loaded for item-based commands
+            const itemsCount = Number((await metaGet(env, "items_count")) || 0);
+            if (!itemsCount && ["watch", "price", "unwatch"].includes(name)) {
+              await followup(interaction, {
+                content: "⚠️ Item dictionary is empty.\nRun `/syncitems` (admin) once to import all items.",
+              });
+              return;
+            }
+
+            // /price
+            if (name === "price") {
+              const userItem = String(opt("item") || "").trim();
+              if (!userItem) {
+                await followup(interaction, { content: "⚠️ Usage: `/price item:<name>`" });
                 return;
               }
 
-              await followup(interaction, "⏳ Syncing item dictionary from tarkov.dev…");
-              const count = await importAllItemsIntoD1(env);
-              await followup(interaction, `✅ Synced **${count.toLocaleString()}** items into D1.`);
+              const rec = await resolveItemFromD1(env, userItem);
+              if (!rec?.id) {
+                await followup(interaction, {
+                  content: `❓ Couldn’t match **${userItem}** in the local dictionary.`,
+                });
+                return;
+              }
+
+              const market = await getMarketPriceRUB(rec.id);
+              if (!market.ok || !market.price) {
+                await followup(interaction, { content: `ℹ️ No flea price available right now for **${rec.name}**.` });
+                return;
+              }
+
+              await followup(interaction, {
+                content: "",
+                embeds: [buildPriceEmbed({ title: `📈 ${rec.name}`, current: market.price })],
+              });
+              return;
+            }
+
+            // /clearwatches
+            if (name === "clearwatches") {
+              const result = await env.flea_bot_db
+                .prepare(`DELETE FROM watches WHERE guild_id=? AND user_id=?`)
+                .bind(guildId, userId)
+                .run();
+
+              const deleted = result?.meta?.changes || 0;
+              await followup(interaction, { content: `🧹 Cleared **${deleted}** watch(es).` });
               return;
             }
 
@@ -330,33 +413,38 @@ export default {
               const once = Boolean(opt("once") || false);
 
               if (!userItem || !Number.isFinite(maxPrice) || maxPrice < 1) {
-                await followup(interaction, "⚠️ Usage: `/watch item:<name> max_price:<number>`");
+                await followup(interaction, { content: "⚠️ Usage: `/watch item:<name> max_price:<number>`" });
                 return;
               }
 
-              const itemsCount = Number((await metaGet(env, "items_count")) || 0);
-              if (!itemsCount) {
-                await followup(
-                  interaction,
-                  "⚠️ Item dictionary is empty.\nRun `/syncitems` (admin) once to import all items."
-                );
+              // Limits (before insert)
+              const userCount = await countUserWatches(env, guildId, userId);
+              const guildCount = await countGuildWatches(env, guildId);
+
+              if (userCount >= MAX_WATCHES_PER_USER) {
+                await followup(interaction, {
+                  content: `⛔ Watch limit reached (**${MAX_WATCHES_PER_USER}** per user). Remove some with \`/unwatch\` or \`/clearwatches\`.`,
+                });
                 return;
               }
 
-              // Resolve canonical item record
+              if (guildCount >= MAX_WATCHES_PER_GUILD) {
+                await followup(interaction, {
+                  content: `⛔ Server watch limit reached (**${MAX_WATCHES_PER_GUILD}**). Ask an admin to clean up old watches.`,
+                });
+                return;
+              }
+
               const rec = await resolveItemFromD1(env, userItem);
               if (!rec?.id) {
-                await followup(
-                  interaction,
-                  `❓ Couldn’t match **${userItem}** in the local dictionary.\nTry a more exact name, or run \`/syncitems\` if it’s outdated.`
-                );
+                await followup(interaction, {
+                  content: `❓ Couldn’t match **${userItem}** in the local dictionary.`,
+                });
                 return;
               }
 
               const canonicalName = rec.name;
               const now = Date.now();
-
-              // IMPORTANT: item_key should be based on canonical name for stable matching
               const itemKey = nameKey(canonicalName);
 
               // Upsert per user/item in guild
@@ -371,10 +459,9 @@ export default {
                   .bind(maxPrice, once ? 1 : 0, rec.id, channelId, canonicalName, existing.id)
                   .run();
 
-                await followup(
-                  interaction,
-                  `♻️ Updated: **${canonicalName}** ≤ **${maxPrice.toLocaleString()} ₽**${once ? " (once)" : ""}`
-                );
+                await followup(interaction, {
+                  content: `♻️ Updated: **${canonicalName}** ≤ **${formatRUB(maxPrice)}**${once ? " (once)" : ""}`,
+                });
                 return;
               }
 
@@ -386,10 +473,9 @@ export default {
                 .bind(guildId, channelId, userId, canonicalName, itemKey, rec.id, maxPrice, once ? 1 : 0, now, 0)
                 .run();
 
-              await followup(
-                interaction,
-                `✅ Watching **${canonicalName}** at **≤ ${maxPrice.toLocaleString()} ₽**${once ? " (once)" : ""}`
-              );
+              await followup(interaction, {
+                content: `✅ Watching **${canonicalName}** at **≤ ${formatRUB(maxPrice)}**${once ? " (once)" : ""}`,
+              });
               return;
             }
 
@@ -409,14 +495,11 @@ export default {
               const results = rows?.results || [];
               const lines = results.length
                 ? results
-                    .map(
-                      (r) =>
-                        `• ${r.item_name} ≤ ${Number(r.max_price).toLocaleString()} ₽${r.once ? " (once)" : ""}`
-                    )
+                    .map((r) => `• ${r.item_name} ≤ ${formatRUB(r.max_price)}${r.once ? " (once)" : ""}`)
                     .join("\n")
                 : "No watches yet. Add one with `/watch`.";
 
-              await followup(interaction, `📌 **Your watches**\n${lines}`);
+              await followup(interaction, { content: `📌 **Your watches**\n${lines}` });
               return;
             }
 
@@ -424,11 +507,11 @@ export default {
             if (name === "unwatch") {
               const item = String(opt("item") || "").trim();
               if (!item) {
-                await followup(interaction, "⚠️ Usage: `/unwatch item:<name>`");
+                await followup(interaction, { content: "⚠️ Usage: `/unwatch item:<name>`" });
                 return;
               }
 
-              // Match on canonical key logic
+              // Use the same canonical-key logic
               const key = nameKey(item);
 
               const result = await env.flea_bot_db
@@ -437,18 +520,17 @@ export default {
                 .run();
 
               const deleted = result?.meta?.changes || 0;
-              await followup(
-                interaction,
-                deleted ? `🧹 Removed watch for **${item}**.` : `ℹ️ No watch found for **${item}**.`
-              );
+              await followup(interaction, {
+                content: deleted ? `🧹 Removed watch for **${item}**.` : `ℹ️ No watch found for **${item}**.`,
+              });
               return;
             }
 
-            await followup(interaction, `Unknown command: /${name}`);
+            await followup(interaction, { content: `Unknown command: /${name}` });
           } catch (err) {
             console.error("Command error:", err);
             try {
-              await followup(interaction, "❌ Something went wrong. Check worker logs.");
+              await followup(interaction, { content: "❌ Something went wrong. Check worker logs." });
             } catch {}
           }
         })()
@@ -466,7 +548,7 @@ export default {
         try {
           const now = Date.now();
 
-          // Optional weekly refresh
+          // Weekly refresh
           if (WEEKLY_REFRESH) {
             const last = Number((await metaGet(env, "items_last_sync_ms")) || 0);
             const WEEK = 7 * 24 * 60 * 60 * 1000;
@@ -508,18 +590,28 @@ export default {
               const target = Number(w.max_price || 0);
 
               if (DEBUG_PRICES && market.raw) {
-                console.log(`[${w.item_name}] avg=${market.raw.avg} low=${market.raw.low} vendor=${market.raw.vendor} => using=${price}`);
+                console.log(
+                  `[${w.item_name}] avg=${market.raw.avg} low=${market.raw.low} => using=${price}`
+                );
               }
 
-              // No valid flea price -> skip
               if (price <= 0) continue;
 
               if (price <= target) {
-                await sendChannelMessage(
-                  env,
-                  w.channel_id,
-                  `🚨 <@${w.user_id}> **${w.item_name}** is now **${price.toLocaleString()} ₽** (≤ ${target.toLocaleString()} ₽)`
-                );
+                // Upgrade alert formatting (embed + mention)
+                const embeds = [
+                  buildPriceEmbed({
+                    title: `🚨 ${w.item_name}`,
+                    current: price,
+                    target,
+                    note: `Cooldown: ${COOLDOWN_MINUTES} min${Number(w.once) === 1 ? " • once-mode" : ""}`,
+                  }),
+                ];
+
+                await sendChannelMessage(env, w.channel_id, {
+                  content: `🚨 <@${w.user_id}>`,
+                  embeds,
+                });
 
                 if (Number(w.once) === 1) {
                   await env.flea_bot_db.prepare(`DELETE FROM watches WHERE id=?`).bind(w.id).run();
